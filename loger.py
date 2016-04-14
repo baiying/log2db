@@ -1,29 +1,38 @@
-#! /usr/bin/env python3   
-# -*- coding: utf-8 -*- 
+#!/usr/local/bin/python3
+# -*- coding: utf-8 -*-
+'''
+loger
+将nginx日志转存到MySQL数据库中
+version 1.0.0
+author cn.baiying@gmail.com
+last modify 2016-04-14
+'''
 import os
+import sys
 import re
 import datetime
 import time
-import urllib
+import requests
 import pymysql
 
-''' find log file '''
+''' 入口方法，程序会自动查找上一时间段的日志文件，也可以通过timeFlay参数指定某一时间段的日志 '''
 def log2db(timeFlag = ""):
-	logDir = r"/Users/test/github/loger/"
+	logDir = r"/alidata/log/nginx/access/api_log_hour/"
 	oneHourBefore = datetime.datetime.now() + datetime.timedelta(hours = -1)
-	ymd = oneHourBefore.strftime("%Y%m%d")
 	if timeFlag == "":
 		timeFlag = oneHourBefore.strftime("%Y%m%d%H")
+
+	ymd = timeFlag[:8]
 	logDir += ymd + "/"
-	logFile = logDir + "log." + timeFlag
+	logFile = logDir + "api.66pei.com.log." + timeFlag
 	if os.path.exists(logFile):
 		getLog(logFile, timeFlag)
 	else:
 		runlog("log file " + logFile + " not exists.")
 
-''' write run log '''
+''' 记录程序运行时异常日志，日志记录存入python_run.log文件中 '''
 def runlog(log = ""):
-	runLogFile = "python_run.log"
+	runLogFile = "/alidata/python/python_run.log"
 	now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 	log = "[" + now + "] " + log
 	try:
@@ -32,7 +41,7 @@ def runlog(log = ""):
 	except IOError as err:
 		print(log, file = rlf)
 
-''' read log file and save to db '''
+''' 读取选定的日志文件内容，并将日志数据经过处理后存储到数据库中 '''
 def getLog(logFile, timeFlag = ""):
 	data = []
 	try:
@@ -41,11 +50,14 @@ def getLog(logFile, timeFlag = ""):
 				if log != "":
 					logDic = convertLog(log)
 					data.append(logDic)
+		res = save2db(data, timeFlag)
+		if res:
+			runlog(logFile + " success.")
+
 	except IOError as err:
 		runlog(str(error))
-	save2db(data, timeFlag)
 
-''' convert log to dict '''
+''' 将日志数据转换为数据字典 '''
 def convertLog(log = ""):
 	ip = r"?P<ip>[\d.]*"
 	date = r"?P<date>\d+/\w+/\d+"
@@ -56,14 +68,17 @@ def convertLog(log = ""):
 	bodyBytesSent = r"?P<bodyBytesSent>\d+"
 	refer = r"?P<refer>[^\"]*"
 	userAgent=r"?P<userAgent>.*"
-	p =  re.compile(r"(%s)\ -\ -\ \[(%s)\:(%s)\ [\S]+\]\ \"(%s)?[\s]?(%s)?.*?\"\ (%s)\ (%s)\ \"(%s)\"\ \"(%s).*?\"" % (ip, date, log_time, method, request, status, bodyBytesSent, refer, userAgent), re.VERBOSE)
+	p =  re.compile(r"(%s)\ [0-9\-]\ [0-9\-]\ \[(%s)\:(%s)\ [\S]+\]\ \"(%s)?[\s]?(%s)?.*?\"\ (%s)\ (%s)\ \"(%s)\"\ \"(%s).*?\"" % (ip, date, log_time, method, request, status, bodyBytesSent, refer, userAgent), re.VERBOSE)
 	m = re.findall(p, log)[0]
 	res = {}
 	res['ip'] = m[0]
 	accTime = convertTime(" ".join(m[1:3]))
 	res['time_str'] = accTime['string']
 	res['time_int'] = accTime['int']
-	res['method'] = m[3]
+	if len(m[3]) > 16:
+		res['method'] = ""
+	else:
+		res['method'] = m[3]
 	res['request'] = m[4]
 	res['status'] = m[5]
 	res['body'] = m[6]
@@ -72,16 +87,20 @@ def convertLog(log = ""):
 
 	params = convertParams(m[4])
 	res['url'] = params['url']
-	res['customer_id'] = params['customer_id']
+	if params['customer_id'] == "":
+		res['customer_id'] = 0
+	else:
+		res['customer_id'] = params['customer_id']
+
 	res['appid'] = params['_appid']
 	res['appversion'] = params['_appversion']
 	res['os'] = params['_os']
-	res['func'] = urllib.parse.unquote(params['_func'])
-	res['sku'] = urllib.parse.unquote(params['sku'])
-	res['brand_id'] = params['brand_id']
+	res['func'] = requests.utils.unquote(params['_func'])
+	res['sku'] = requests.utils.unquote(params['sku'])
+	res['brand_id'] = requests.utils.unquote(params['brand_id'])
 	return res
 
-''' format time string '''
+''' 格式化日志中的时间字段 '''
 def convertTime(timeStr = ""):
 	arr = timeStr.split()
 	dt = datetime.datetime.strptime(" ".join(arr[:2]), '%d/%b/%Y %H:%M:%S')
@@ -90,7 +109,7 @@ def convertTime(timeStr = ""):
 	res['int'] = int(time.mktime(time.strptime(res['string'], '%Y-%m-%d %H:%M:%S')))
 	return res
 
-''' convert request params to dict '''
+''' 将日志中的请求参数转换为数据字典，供convertLog方法调用 '''
 def convertParams(request = ""):
 	columns = ['url', 'customer_id', '_appid', '_appversion', '_os', '_func', 'sku', 'brand_id']
 	res = {}
@@ -101,7 +120,7 @@ def convertParams(request = ""):
 	res['_os'] = ""
 	res['_func'] = ""
 	res['sku'] = ""
-	res['brand_id'] = 0
+	res['brand_id'] = ""
 	if('?' in request):
 		arr = request.split('?')
 		res['url'] = arr[0]
@@ -111,16 +130,22 @@ def convertParams(request = ""):
 				res[tmp[0]] = tmp[1]
 	return res
 
-''' save data to db '''
+''' 将整理出来的日志数据字典保存到数据库中 '''
 def save2db(data = [], timeFlag = ""):
 	try:
 		conn = pymysql.connect(host='127.0.0.1', user='root', passwd='', db='log', port=3306, charset='utf8')
 		cur = conn.cursor()
-		# 生成sql
+		# 判断此批数据是否已经入过库了，如果已入过，则删除重入
+		sql = "DELETE FROM 66_api WHERE time_flag = '%s'" % timeFlag
+		cur.execute(sql)
+
+		# 生成入库sql
 		for item in data:
-			sql = "INSERT INTO log SET "
+			sql = r'''INSERT INTO 66_api SET '''
 			spl = ""
 			for (key, val) in item.items():
+				if isinstance(val, str) and "'" in val:
+					val = val.replace("'", "‘")
 				sql += spl + "%s = '%s'" % (key, val)
 				spl = ", "
 			sql += ", dt = '%s'" % time.strftime('%Y-%m-%d %H-%M-%S', time.localtime(time.time()))
@@ -130,7 +155,14 @@ def save2db(data = [], timeFlag = ""):
 		conn.commit()
 		cur.close
 		conn.close
+		return True
 	except pymysql.Error as err:
 		runlog(str(err))
+		return False
 
-log2db()
+# 执行程序
+if len(sys.argv) == 1:
+	log2db()
+else:
+	log2db(sys.argv[1])
+
